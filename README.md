@@ -18,9 +18,9 @@ trufflehog --version
 
 **Usage**
 ```
-python3 github_search_v7.py -h
+python3 github-security-scanner.py -h
 
-usage: github_search_v7.py [-h] (-k KEYWORD | -kf KEYWORDS_FILE) [-t TOKEN] [-o OUTPUT] [--max-size MAX_SIZE] [--issues] [--xlsx]
+usage: github-security-scanner.py [-h] (-k KEYWORD | -kf KEYWORDS_FILE) [-t TOKEN] [-o OUTPUT] [--max-size MAX_SIZE] [--issues] [--xlsx]
 
 GitHub search + TruffleHog scan
 
@@ -59,7 +59,7 @@ private_key
 
 Skip repositories larger than specified size (in MB):
 ```
-python github_search_v7.py -k "password" -t YOUR_TOKEN --max-size 100
+python github-security-scanner.py -k "password" -t YOUR_TOKEN --max-size 100
 ```
 
 **Example 4: Search Github Issues for Data Leaks**
