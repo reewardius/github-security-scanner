@@ -24,6 +24,7 @@ group.add_argument("-kf", "--keywords-file", help="File with keywords (one per l
 parser.add_argument("-t", "--token", help="GitHub API token")
 parser.add_argument("-o", "--output", default="github_secrets", help="Output filename without extension (default: github_secrets)")
 parser.add_argument("--max-size", type=int, default=500, help="Max repo size in MB (default: 500MB)")
+parser.add_argument("--min-year", type=int, default=2024, help="Minimum year of last commit (default: 2024, only scan repos updated in 2024+)")
 parser.add_argument("--issues", action="store_true", help="Search only in GitHub issues instead of code")
 
 # Форматы вывода (можно указать несколько)
@@ -45,6 +46,8 @@ GITHUB_TOKEN = args.token
 OUTPUT_BASENAME = args.output
 TEMP_DIR = "./temp_repos"
 MAX_SIZE_KB = args.max_size * 1024  # KB
+MIN_YEAR = args.min_year  # Минимальный год последнего коммита
+CACHE_FILE = ".github_scanner_cache.json"  # Локальный кеш просканированных репозиториев
 
 # Если не указан ни один формат, по умолчанию используем XLSX
 if not any([args.xlsx, args.csv, args.json, args.xml, args.txt]):
@@ -143,6 +146,50 @@ def get_last_commit(repo_full_name):
     date = commit_data["commit"]["author"]["date"]
     return (author_name, date)
 
+def get_commit_year(date_string):
+    """Извлекает год из даты коммита в формате ISO 8601"""
+    try:
+        # Формат: 2024-01-15T10:30:00Z
+        year = int(date_string.split('-')[0])
+        return year
+    except:
+        return None
+
+def load_cache():
+    """Загружает кеш просканированных репозиториев из JSON файла"""
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+                return {
+                    'repos': set(cache_data.get('repos', [])),
+                    'last_scan': cache_data.get('last_scan', None),
+                    'scan_count': cache_data.get('scan_count', 0)
+                }
+    except Exception as e:
+        print_warn(f"Warning: Could not load cache file: {e}")
+    
+    # Возвращаем пустой кеш если файл не существует или ошибка
+    return {
+        'repos': set(),
+        'last_scan': None,
+        'scan_count': 0
+    }
+
+def save_cache(repos_set, previous_cache):
+    """Сохраняет кеш просканированных репозиториев в JSON файл"""
+    try:
+        cache_data = {
+            'repos': list(repos_set),
+            'last_scan': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'scan_count': previous_cache['scan_count'] + 1
+        }
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2, ensure_ascii=False)
+        print_info(f"Cache saved to {CACHE_FILE}")
+    except Exception as e:
+        print_warn(f"Warning: Could not save cache file: {e}")
+
 def get_repo_size(repo_full_name):
     url = f"https://api.github.com/repos/{repo_full_name}"
     response = requests.get(url, headers=HEADERS)
@@ -235,6 +282,20 @@ def save_to_xlsx(data, filename):
                 
                 cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
                 cell.border = thin_border
+        
+        # Цветовое выделение для колонки "Status" (если есть)
+        if 'Status' in df.columns:
+            status_col_idx = df.columns.get_loc('Status') + 1
+            new_fill = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')  # Светло-зеленый
+            new_font = Font(bold=True, color='006400')  # Темно-зеленый текст
+            
+            for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row,
+                                          min_col=status_col_idx, max_col=status_col_idx):
+                for cell in row:
+                    if cell.value and '🆕 NEW' in str(cell.value):
+                        cell.fill = new_fill
+                        cell.font = new_font
+                    cell.border = thin_border
         
         # Автоматическая ширина колонок
         for column in worksheet.columns:
@@ -364,15 +425,30 @@ def send_email_report(subject, body_text, sender, recipient, aws_region, attachm
 start_time = datetime.now()
 
 try:
+    # Загружаем кеш из предыдущих сканирований
+    previous_cache = load_cache()
+    previous_repos = previous_cache['repos']
+    
+    if previous_repos:
+        print_info(f"📦 Loaded cache: {len(previous_repos)} repos from previous scans")
+        print_info(f"   Last scan: {previous_cache['last_scan']}")
+        print_info(f"   Total scans: {previous_cache['scan_count']}")
+    else:
+        print_info("📦 No previous cache found - first scan")
+    
     total_repos_count = 0
     matched_repos_count = 0
-    skipped_repos_count = 0  # Счетчик пропущенных (уже просканированных)
+    skipped_repos_count = 0  # Счетчик пропущенных (уже просканированных в этом запуске)
+    old_repos_count = 0  # Счетчик старых репозиториев (до MIN_YEAR)
+    new_repos_count = 0  # Счетчик новых репозиториев (не было в предыдущих сканах)
     
     results_list = []
     public_list = []
     
-    # Кеш уже просканированных репозиториев (по URL)
+    # Кеш уже просканированных репозиториев в текущем запуске (по URL)
     scanned_repos_cache = set()
+    # Список новых репозиториев (не было в предыдущих сканах)
+    new_repos_list = []
     
     for keyword in SEARCH_KEYWORDS:
         print_info(f"Processing keyword: '{keyword}'")
@@ -405,13 +481,19 @@ try:
                 repo_full_name = item["repository"]["full_name"]
                 total_repos_count += 1
                 
-                # Проверяем кеш - если репозиторий уже сканировался, пропускаем
+                # Проверяем кеш текущего запуска - если репозиторий уже сканировался, пропускаем
                 if repo_url in scanned_repos_cache:
                     skipped_repos_count += 1
                     print_info(f"⚡ Skipping already scanned repo: {repo_url}")
                     continue
                 
-                # Добавляем в кеш
+                # Проверяем является ли репозиторий новым (не было в предыдущих сканах)
+                is_new_repo = repo_url not in previous_repos
+                if is_new_repo:
+                    new_repos_count += 1
+                    print_info(f"🆕 NEW repository detected: {repo_url}")
+                
+                # Добавляем в кеш текущего запуска
                 scanned_repos_cache.add(repo_url)
 
                 repo_size_kb, is_private = get_repo_size(repo_full_name)
@@ -427,7 +509,25 @@ try:
                         "Github Link": repo_url,
                         "Author": "",
                         "Date of Last Commit": "",
-                        "Keyword": keyword
+                        "Keyword": keyword,
+                        "Status": "🆕 NEW" if is_new_repo else "Existing"
+                    })
+                    continue
+                
+                # Получаем информацию о последнем коммите ПЕРЕД клонированием
+                commiter, last_commit_date = get_last_commit(repo_full_name)
+                
+                # Проверяем год последнего коммита
+                commit_year = get_commit_year(last_commit_date)
+                if commit_year and commit_year < MIN_YEAR:
+                    old_repos_count += 1
+                    print_warn(f"Skipping old repo (last commit: {commit_year}): {repo_url}")
+                    public_list.append({
+                        "Github Link": repo_url,
+                        "Author": commiter,
+                        "Date of Last Commit": last_commit_date,
+                        "Keyword": keyword,
+                        "Status": "🆕 NEW" if is_new_repo else "Existing"
                     })
                     continue
 
@@ -437,13 +537,22 @@ try:
                     print_warn(f"Failed to clone {repo_url}")
                     continue
 
-                commiter, last_commit_date = get_last_commit(repo_full_name)
                 public_list.append({
                     "Github Link": repo_url,
                     "Author": commiter,
                     "Date of Last Commit": last_commit_date,
-                    "Keyword": keyword
+                    "Keyword": keyword,
+                    "Status": "🆕 NEW" if is_new_repo else "Existing"
                 })
+                
+                # Сохраняем информацию о новом репозитории
+                if is_new_repo:
+                    new_repos_list.append({
+                        "Github Link": repo_url,
+                        "Author": commiter,
+                        "Date of Last Commit": last_commit_date,
+                        "Keyword": keyword
+                    })
 
                 try:
                     result = subprocess.run(
@@ -502,6 +611,14 @@ try:
     print_info("Saving results...")
     save_results(results_list, OUTPUT_BASENAME, args)
     save_results(public_list, f"{OUTPUT_BASENAME}_public_repos", args)
+    
+    # Сохраняем отдельный файл с новыми репозиториями (если есть)
+    if new_repos_list:
+        print_info(f"Saving NEW repositories report ({len(new_repos_list)} repos)...")
+        save_results(new_repos_list, f"{OUTPUT_BASENAME}_new_repos", args)
+    
+    # Обновляем кеш
+    save_cache(scanned_repos_cache, previous_cache)
 
     # ======== Итоговая статистика ========
     end_time = datetime.now()
@@ -511,10 +628,17 @@ try:
     
     print_info(f"Total repositories found: {total_repos_count}")
     print_info(f"Unique repositories scanned: {unique_repos_scanned}")
+    if new_repos_count > 0:
+        print_info(f"🆕 NEW repositories (not in previous scans): {new_repos_count} repos")
+    if old_repos_count > 0:
+        print_info(f"⏰ Skipped (old, before {MIN_YEAR}): {old_repos_count} repos")
     if skipped_repos_count > 0:
         print_info(f"⚡ Skipped (already scanned): {skipped_repos_count} repos")
         saved_time = skipped_repos_count * 5  # Примерно 5 секунд на репозиторий
-        print_info(f"⚡ Time saved: ~{saved_time} seconds")
+        print_info(f"⚡ Time saved by caching: ~{saved_time} seconds")
+    if old_repos_count > 0:
+        saved_time_old = old_repos_count * 5
+        print_info(f"⏰ Time saved by year filter: ~{saved_time_old} seconds")
     print_info(f"Repositories with secrets found: {matched_repos_count}")
     print_info(f"Scan duration: {duration:.1f} seconds")
     print_info(f"Scan complete!")
@@ -581,13 +705,18 @@ Results Files (Formats: {formats_str}):
         
         # Статистика производительности
         performance_stats = ""
+        perf_lines = []
+        
+        if old_repos_count > 0:
+            perf_lines.append(f"  ⏰ Old repositories skipped (before {MIN_YEAR}): {old_repos_count}")
+            perf_lines.append(f"  ⏰ Time saved by year filter: ~{old_repos_count * 5} seconds")
+        
         if skipped_repos_count > 0:
-            performance_stats = f"""
-Performance Optimization:
-  ⚡ Duplicate repositories skipped: {skipped_repos_count}
-  ⚡ Unique repositories scanned: {unique_repos_scanned}
-  ⚡ Time saved: ~{skipped_repos_count * 5} seconds
-"""
+            perf_lines.append(f"  ⚡ Duplicate repositories skipped: {skipped_repos_count}")
+            perf_lines.append(f"  ⚡ Time saved by caching: ~{skipped_repos_count * 5} seconds")
+        
+        if perf_lines:
+            performance_stats = "\nPerformance Optimization:\n" + "\n".join(perf_lines) + "\n"
         
         body_text = f"""GitHub Security Scanner Report
 {'='*60}
