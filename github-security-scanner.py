@@ -520,11 +520,6 @@ try:
         else:
             subject = f"✅ GitHub Security Scan - No Secrets Found"
         
-        # Формируем тело письма
-        keywords_list = ", ".join(SEARCH_KEYWORDS[:5])
-        if len(SEARCH_KEYWORDS) > 5:
-            keywords_list += f", ... (and {len(SEARCH_KEYWORDS) - 5} more)"
-        
         # Список файлов результатов
         files_list = f"""
 Results Files (Formats: {formats_str}):
@@ -565,7 +560,6 @@ Results Files (Formats: {formats_str}):
 
 Scan Summary:
 -------------
-Keywords searched: {keywords_list}
 Total repositories scanned: {total_repos_count}
 Repositories with secrets found: {matched_repos_count}
 Total secrets detected: {len(results_list)}
@@ -603,7 +597,6 @@ except KeyboardInterrupt:
                 body_text=f"""GitHub Security Scanner was interrupted by user.
 
 Scan details:
-- Keywords: {', '.join(SEARCH_KEYWORDS[:3])}{'...' if len(SEARCH_KEYWORDS) > 3 else ''}
 - Interrupted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - Repositories scanned before interruption: {total_repos_count}
 - Secrets found before interruption: {matched_repos_count}
@@ -634,7 +627,6 @@ Error details:
 {error_msg}
 
 Scan details:
-- Keywords: {', '.join(SEARCH_KEYWORDS[:3])}{'...' if len(SEARCH_KEYWORDS) > 3 else ''}
 - Error occurred at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - Repositories scanned: {total_repos_count if 'total_repos_count' in locals() else 0}
 - Secrets found: {matched_repos_count if 'matched_repos_count' in locals() else 0}
