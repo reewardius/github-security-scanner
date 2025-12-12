@@ -7,10 +7,14 @@ import argparse
 import shutil
 import re
 from time import sleep
+from datetime import datetime
 import pandas as pd
 import json
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+import boto3
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # ======== Аргументы командной строки ========
 parser = argparse.ArgumentParser(description="GitHub search + TruffleHog scan")
@@ -28,6 +32,11 @@ parser.add_argument("--csv", action="store_true", help="Save results to CSV form
 parser.add_argument("--json", action="store_true", help="Save results to JSON format")
 parser.add_argument("--xml", action="store_true", help="Save results to XML format")
 parser.add_argument("--txt", action="store_true", help="Save results to TXT format (pipe-separated)")
+
+# AWS SES параметры (опционально)
+parser.add_argument("--email-sender", help="Sender email address (must be verified in SES)")
+parser.add_argument("--email-recipient", help="Recipient email address")
+parser.add_argument("--aws-region", default="eu-central-1", help="AWS region for SES (default: eu-central-1)")
 
 args = parser.parse_args()
 
@@ -144,9 +153,112 @@ def get_repo_size(repo_full_name):
 
 # ======== Функции сохранения в разных форматах ========
 def save_to_xlsx(data, filename):
-    """Сохранение в Excel формат"""
+    """Сохранение в Excel формат с красивым форматированием"""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    
     df = pd.DataFrame(data)
-    df.to_excel(filename, index=False)
+    
+    # Создаем Excel writer
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Results')
+        
+        # Получаем workbook и worksheet
+        workbook = writer.book
+        worksheet = writer.sheets['Results']
+        
+        # Стили для границ
+        thin_border = Border(
+            left=Side(style='thin', color='000000'),
+            right=Side(style='thin', color='000000'),
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='thin', color='000000')
+        )
+        
+        # Форматирование заголовков
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        # Применяем стили к заголовкам
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cell.border = thin_border
+        
+        # Чередующиеся цвета строк и границы
+        light_fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+        white_fill = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
+        
+        for row_idx, row in enumerate(worksheet.iter_rows(min_row=2, max_row=worksheet.max_row), start=2):
+            # Чередуем цвета
+            fill = light_fill if row_idx % 2 == 0 else white_fill
+            
+            for cell in row:
+                cell.fill = fill
+                cell.border = thin_border
+                cell.alignment = Alignment(vertical='center', wrap_text=False)
+        
+        # Цветовое выделение для колонки "Keyword" (если есть)
+        keyword_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+        keyword_font = Font(bold=True, color='000000')
+        
+        if 'Keyword' in df.columns:
+            keyword_col_idx = df.columns.get_loc('Keyword') + 1
+            for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row, 
+                                          min_col=keyword_col_idx, max_col=keyword_col_idx):
+                for cell in row:
+                    cell.fill = keyword_fill
+                    cell.font = keyword_font
+                    cell.border = thin_border
+        
+        # Цветовое выделение для колонки "Detector Type" (если есть)
+        if 'Detector Type' in df.columns:
+            detector_col_idx = df.columns.get_loc('Detector Type') + 1
+            detector_colors = {
+                'AWS': 'FFE699',      # Желтый
+                'Private Key': 'F4B084',  # Оранжевый
+                'Database': 'C6E0B4',     # Зеленый
+                'Generic API': 'B4C7E7',  # Голубой
+            }
+            
+            for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
+                cell = row[detector_col_idx - 1]
+                detector_type = str(cell.value)
+                
+                # Определяем цвет по типу детектора
+                color = 'FFFFFF'  # По умолчанию белый
+                for key, val in detector_colors.items():
+                    if key.lower() in detector_type.lower():
+                        color = val
+                        break
+                
+                cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
+                cell.border = thin_border
+        
+        # Автоматическая ширина колонок
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            
+            for cell in column:
+                try:
+                    cell_value = str(cell.value) if cell.value else ""
+                    if len(cell_value) > max_length:
+                        max_length = len(cell_value)
+                except:
+                    pass
+            
+            # Ограничиваем максимальную ширину
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = max(adjusted_width, 10)
+        
+        # Закрепляем верхнюю строку (заголовки)
+        worksheet.freeze_panes = 'A2'
+        
+        # Добавляем автофильтр
+        worksheet.auto_filter.ref = worksheet.dimensions
+    
     print_info(f"Results saved to {filename}")
 
 def save_to_csv(data, filename):
@@ -219,14 +331,46 @@ def save_results(data, basename, formats):
     if args.txt:
         save_to_txt(data, f"{basename}.txt")
 
+def send_email_report(subject, body_text, sender, recipient, aws_region, attachments_info=None):
+    """Отправка email отчета через AWS SES"""
+    try:
+        # Создаем SES клиент
+        ses_client = boto3.client("ses", region_name=aws_region)
+        
+        # Создаем email сообщение
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = recipient
+        msg["Subject"] = subject
+        
+        # Добавляем текст письма
+        msg.attach(MIMEText(body_text, "plain"))
+        
+        # Отправляем email
+        response = ses_client.send_raw_email(
+            Source=sender,
+            Destinations=[recipient],
+            RawMessage={"Data": msg.as_string()}
+        )
+        
+        print_info(f"✅ Email sent successfully! MessageId: {response['MessageId']}")
+        return True
+        
+    except Exception as e:
+        print_warn(f"❌ Error sending email: {e}")
+        return False
+
 # ======== Основной пайплайн ========
-total_repos_count = 0
-matched_repos_count = 0
+start_time = datetime.now()
 
-results_list = []
-public_list = []
-
-for keyword in SEARCH_KEYWORDS:
+try:
+    total_repos_count = 0
+    matched_repos_count = 0
+    
+    results_list = []
+    public_list = []
+    
+    for keyword in SEARCH_KEYWORDS:
     print_info(f"Processing keyword: '{keyword}'")
     
     if args.issues:
@@ -350,3 +494,160 @@ save_results(public_list, f"{OUTPUT_BASENAME}_public_repos", args)
 print_info(f"Total repositories scanned: {total_repos_count}")
 print_info(f"Repositories/issues with matched secrets: {matched_repos_count}")
 print_info(f"Scan complete!")
+
+# ======== Отправка email отчета (если указаны параметры) ========
+if args.email_sender and args.email_recipient:
+    print_info("Preparing email report...")
+    
+    # Определяем какие форматы были сохранены
+    formats_saved = []
+    if args.xlsx:
+        formats_saved.append("XLSX")
+    if args.csv:
+        formats_saved.append("CSV")
+    if args.json:
+        formats_saved.append("JSON")
+    if args.xml:
+        formats_saved.append("XML")
+    if args.txt:
+        formats_saved.append("TXT")
+    
+    formats_str = ", ".join(formats_saved)
+    
+    # Формируем тему письма
+    if matched_repos_count > 0:
+        subject = f"🚨 GitHub Security Scan - {matched_repos_count} Secrets Found!"
+    else:
+        subject = f"✅ GitHub Security Scan - No Secrets Found"
+    
+    # Формируем тело письма
+    keywords_list = ", ".join(SEARCH_KEYWORDS[:5])
+    if len(SEARCH_KEYWORDS) > 5:
+        keywords_list += f", ... (and {len(SEARCH_KEYWORDS) - 5} more)"
+    
+    # Список файлов результатов
+    files_list = f"""
+Results Files (Formats: {formats_str}):
+- {OUTPUT_BASENAME}.{formats_saved[0].lower()} (main results with secrets)
+- {OUTPUT_BASENAME}_public_repos.{formats_saved[0].lower()} (all scanned repositories)
+"""
+    
+    # Топ детекторов (если есть результаты)
+    detector_stats = ""
+    if results_list:
+        detectors = {}
+        for item in results_list:
+            detector = item.get('Detector Type', 'Unknown')
+            if detector:
+                detectors[detector] = detectors.get(detector, 0) + 1
+        
+        if detectors:
+            detector_stats = "\n\nTop Detector Types:"
+            for detector, count in sorted(detectors.items(), key=lambda x: x[1], reverse=True)[:5]:
+                detector_stats += f"\n  - {detector}: {count} findings"
+    
+    # Топ ключевых слов с находками
+    keyword_stats = ""
+    if results_list:
+        keywords = {}
+        for item in results_list:
+            kw = item.get('Keyword', 'Unknown')
+            if kw:
+                keywords[kw] = keywords.get(kw, 0) + 1
+        
+        if keywords:
+            keyword_stats = "\n\nTop Keywords with Findings:"
+            for kw, count in sorted(keywords.items(), key=lambda x: x[1], reverse=True)[:5]:
+                keyword_stats += f"\n  - {kw}: {count} secrets found"
+    
+    body_text = f"""GitHub Security Scanner Report
+{'='*60}
+
+Scan Summary:
+-------------
+Keywords searched: {keywords_list}
+Total repositories scanned: {total_repos_count}
+Repositories with secrets found: {matched_repos_count}
+Total secrets detected: {len(results_list)}
+
+{files_list}
+{detector_stats}
+{keyword_stats}
+
+{'='*60}
+Scan completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+⚠️ Please review the results files and take appropriate action for any secrets found.
+Ensure all exposed credentials are rotated immediately!
+
+This is an automated report from GitHub Security Scanner.
+"""
+    
+    # Отправляем email
+    send_email_report(
+        subject=subject,
+        body_text=body_text,
+        sender=args.email_sender,
+        recipient=args.email_recipient,
+        aws_region=args.aws_region
+    )
+
+except KeyboardInterrupt:
+    print_warn("\n⚠️ Scan interrupted by user")
+    
+    # Отправляем email об остановке (если настроен)
+    if args.email_sender and args.email_recipient:
+        try:
+            send_email_report(
+                subject="⚠️ GitHub Security Scan - Interrupted",
+                body_text=f"""GitHub Security Scanner was interrupted by user.
+
+Scan details:
+- Keywords: {', '.join(SEARCH_KEYWORDS[:3])}{'...' if len(SEARCH_KEYWORDS) > 3 else ''}
+- Interrupted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- Repositories scanned before interruption: {total_repos_count}
+- Secrets found before interruption: {matched_repos_count}
+
+This is an automated notification from GitHub Security Scanner.
+""",
+                sender=args.email_sender,
+                recipient=args.email_recipient,
+                aws_region=args.aws_region
+            )
+        except:
+            pass
+    
+    exit(1)
+
+except Exception as e:
+    error_msg = f"Critical error: {str(e)}"
+    print_warn(f"\n❌ {error_msg}")
+    
+    # Отправляем email об ошибке (если настроен)
+    if args.email_sender and args.email_recipient:
+        try:
+            send_email_report(
+                subject="❌ GitHub Security Scan - Critical Error",
+                body_text=f"""A critical error occurred during the GitHub security scan.
+
+Error details:
+{error_msg}
+
+Scan details:
+- Keywords: {', '.join(SEARCH_KEYWORDS[:3])}{'...' if len(SEARCH_KEYWORDS) > 3 else ''}
+- Error occurred at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- Repositories scanned: {total_repos_count if 'total_repos_count' in locals() else 0}
+- Secrets found: {matched_repos_count if 'matched_repos_count' in locals() else 0}
+
+Please check the scanner logs for more details.
+
+This is an automated error notification from GitHub Security Scanner.
+""",
+                sender=args.email_sender,
+                recipient=args.email_recipient,
+                aws_region=args.aws_region
+            )
+        except:
+            pass
+    
+    exit(1)
