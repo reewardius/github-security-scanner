@@ -15,7 +15,7 @@ from xml.dom import minidom
 # ======== Аргументы командной строки ========
 parser = argparse.ArgumentParser(description="GitHub search + TruffleHog scan")
 group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument("-k", "--keyword", help="Single keyword to search")
+group.add_argument("-k", "--keyword", help="Single keyword or comma-separated keywords to search (e.g., 'password' or 'password,api_key,secret')")
 group.add_argument("-kf", "--keywords-file", help="File with keywords (one per line)")
 parser.add_argument("-t", "--token", help="GitHub API token")
 parser.add_argument("-o", "--output", default="github_secrets", help="Output filename without extension (default: github_secrets)")
@@ -50,7 +50,9 @@ HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 # ======== Список ключевых слов ========
 if args.keyword:
-    SEARCH_KEYWORDS = [args.keyword]
+    # Поддержка множественных ключевых слов через запятую
+    # Пример: -k "password,api_key,secret"
+    SEARCH_KEYWORDS = [kw.strip() for kw in args.keyword.split(',') if kw.strip()]
 elif args.keywords_file:
     with open(args.keywords_file, "r", encoding="utf-8") as f:
         SEARCH_KEYWORDS = [line.strip() for line in f if line.strip()]
@@ -118,9 +120,19 @@ def get_last_commit(repo_full_name):
     if response.status_code != 200 or not response.json():
         return ("Unknown", "Unknown")
     commit_data = response.json()[0]
-    commiter = commit_data["commit"]["committer"]["name"]
-    date = commit_data["commit"]["committer"]["date"]
-    return (commiter, date)
+    
+    # Пробуем получить автора, если не получается - берем коммитера
+    # author - реальный автор коммита
+    # committer - может быть "GitHub" для веб-интерфейса
+    author_name = commit_data["commit"]["author"]["name"]
+    
+    # Если автор "GitHub" или пустой, пробуем получить login пользователя
+    if author_name == "GitHub" or not author_name or author_name == "Unknown":
+        if commit_data.get("author") and commit_data["author"].get("login"):
+            author_name = commit_data["author"]["login"]
+    
+    date = commit_data["commit"]["author"]["date"]
+    return (author_name, date)
 
 def get_repo_size(repo_full_name):
     url = f"https://api.github.com/repos/{repo_full_name}"
@@ -307,7 +319,7 @@ for keyword in SEARCH_KEYWORDS:
                             results_list.append({
                                 "Keyword": keyword,
                                 "Github Link": repo_url,
-                                "Last Commiter": commiter,
+                                "Last Commiter": commiter,  # Оставляем "Last Commiter" для совместимости с колонкой
                                 "Date of Last Commit": last_commit_date,
                                 "Detector Type": current_detector,
                                 "File Path": current_file,
