@@ -366,9 +366,13 @@ start_time = datetime.now()
 try:
     total_repos_count = 0
     matched_repos_count = 0
+    skipped_repos_count = 0  # Счетчик пропущенных (уже просканированных)
     
     results_list = []
     public_list = []
+    
+    # Кеш уже просканированных репозиториев (по URL)
+    scanned_repos_cache = set()
     
     for keyword in SEARCH_KEYWORDS:
         print_info(f"Processing keyword: '{keyword}'")
@@ -400,6 +404,15 @@ try:
                 repo_url = item["repository"]["html_url"]
                 repo_full_name = item["repository"]["full_name"]
                 total_repos_count += 1
+                
+                # Проверяем кеш - если репозиторий уже сканировался, пропускаем
+                if repo_url in scanned_repos_cache:
+                    skipped_repos_count += 1
+                    print_info(f"⚡ Skipping already scanned repo: {repo_url}")
+                    continue
+                
+                # Добавляем в кеш
+                scanned_repos_cache.add(repo_url)
 
                 repo_size_kb, is_private = get_repo_size(repo_full_name)
                 if is_private:
@@ -491,8 +504,19 @@ try:
     save_results(public_list, f"{OUTPUT_BASENAME}_public_repos", args)
 
     # ======== Итоговая статистика ========
-    print_info(f"Total repositories scanned: {total_repos_count}")
-    print_info(f"Repositories/issues with matched secrets: {matched_repos_count}")
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    
+    unique_repos_scanned = len(scanned_repos_cache)
+    
+    print_info(f"Total repositories found: {total_repos_count}")
+    print_info(f"Unique repositories scanned: {unique_repos_scanned}")
+    if skipped_repos_count > 0:
+        print_info(f"⚡ Skipped (already scanned): {skipped_repos_count} repos")
+        saved_time = skipped_repos_count * 5  # Примерно 5 секунд на репозиторий
+        print_info(f"⚡ Time saved: ~{saved_time} seconds")
+    print_info(f"Repositories with secrets found: {matched_repos_count}")
+    print_info(f"Scan duration: {duration:.1f} seconds")
     print_info(f"Scan complete!")
 
     # ======== Отправка email отчета (если указаны параметры) ========
@@ -555,15 +579,27 @@ Results Files (Formats: {formats_str}):
                 for kw, count in sorted(keywords.items(), key=lambda x: x[1], reverse=True)[:5]:
                     keyword_stats += f"\n  - {kw}: {count} secrets found"
         
+        # Статистика производительности
+        performance_stats = ""
+        if skipped_repos_count > 0:
+            performance_stats = f"""
+Performance Optimization:
+  ⚡ Duplicate repositories skipped: {skipped_repos_count}
+  ⚡ Unique repositories scanned: {unique_repos_scanned}
+  ⚡ Time saved: ~{skipped_repos_count * 5} seconds
+"""
+        
         body_text = f"""GitHub Security Scanner Report
 {'='*60}
 
 Scan Summary:
 -------------
-Total repositories scanned: {total_repos_count}
+Total repositories found: {total_repos_count}
+Unique repositories scanned: {unique_repos_scanned}
 Repositories with secrets found: {matched_repos_count}
 Total secrets detected: {len(results_list)}
-
+Scan duration: {duration:.1f} seconds
+{performance_stats}
 {files_list}
 {detector_stats}
 {keyword_stats}
